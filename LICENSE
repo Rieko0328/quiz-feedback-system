@@ -1,0 +1,67 @@
+版权所有 (C) 2026 Rieko0328
+Copyright (C) 2026 Rieko0328
+
+保留所有权利 / All Rights Reserved
+
+================================================================
+中文说明
+================================================================
+
+本软件及其全部源代码、文档、设计思路（以下统称「本作品」）的著作权
+归上述著作权人（GitHub 账号 @Rieko0328）所有，受《中华人民共和国著作权法》及国际著作权公约保护。
+
+未经著作权人事先书面许可，任何人不得：
+
+  1. 复制、下载后二次分发本作品的任何部分；
+  2. 修改、翻译、演绎本作品，或基于本作品创作衍生作品；
+  3. 将本作品或其衍生品用于任何商业用途；
+  4. 去除、隐藏或篡改本作品中的著作权声明、作者署名或本许可证；
+  5. 以本作品申请专利、软件著作权登记或其他知识产权。
+
+**允许**的行为仅限于：在 GitHub 平台上通过 Fork 功能进行浏览与学习，
+且必须完整保留本许可证文件与全部署名信息。
+
+任何违反上述条款的使用，均构成著作权侵权，著作权人保留追究其
+法律责任并要求赔偿的权利。
+
+================================================================
+English
+================================================================
+
+All rights reserved.
+
+The copyright in this software and all associated source code,
+documentation and design (the "Work") is owned by the copyright
+holder named above and is protected by the copyright laws of the
+People's Republic of China and international copyright treaties.
+
+No part of the Work may be reproduced, distributed, modified,
+translated, adapted, publicly performed, sublicensed, or used for
+any commercial purpose without the prior written permission of the
+copyright holder.
+
+You may not remove or alter any copyright notice, attribution, or
+this license from the Work.
+
+The only permitted use is viewing and learning through GitHub's Fork
+feature, provided this license file and all attribution notices are
+kept intact.
+
+Any use in violation of these terms constitutes copyright
+infringement, and the copyright holder reserves the right to pursue
+all available legal remedies.
+
+================================================================
+第三方组件
+================================================================
+
+本作品在运行时使用以下第三方开源库，它们各自遵循其原有许可证，
+不受本许可证影响：
+
+  - Pillow (PIL)                      MIT-CMU License
+  - python-docx                       MIT License
+  - openpyxl                          MIT License
+  - lxml                              BSD License
+
+本作品通过 HTTP 调用第三方 AI 服务的公开 API，不包含亦不分发
+这些服务的任何代码。使用者需自行申请并承担相应费用。
