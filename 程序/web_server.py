@@ -349,7 +349,6 @@ def route_post(path: str, body: dict):
     if path == "/api/upload":
         # 浏览器原生文件对话框选的文件，前端读成 base64 传过来
         import base64
-        import tempfile
         nm = (body.get("filename") or "上传文件").strip()
         b64 = body.get("b64") or ""
         kind = body.get("kind") or "temp"
@@ -378,9 +377,13 @@ def route_post(path: str, body: dict):
                     if l.strip() and not l.strip().startswith(("#", "@")))
             return {"ok": True, "path": str(dst), "题数": n,
                     "text": text}
-        tmp = Path(tempfile.gettempdir()) / "课测反馈_上传"
-        tmp.mkdir(exist_ok=True)
-        dst = tmp / nm
+        # 【重要】不要用系统临时目录 —— 某些受限环境（如沙箱、只读配置的机器）
+        # 不允许写 %TEMP%，会导致「选了文件却报错」。统一放到工作区里。
+        tmp = ROOT / "生成结果" / "_已选文件"
+        tmp.mkdir(parents=True, exist_ok=True)
+        # 去掉文件名里可能的路径成分，防止目录穿越
+        safe = Path(nm).name or "上传文件.xlsx"
+        dst = tmp / safe
         dst.write_bytes(raw)
         return {"ok": True, "path": str(dst)}
 
