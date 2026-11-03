@@ -6,14 +6,14 @@
 熊老师专用：每周课测 -> 成绩表 + 家长话术 + 错题小练习
 
 目录约定（相对本脚本所在的「课测反馈系统」根目录）：
-  1-名单/<班级>.txt     姓名 + 分数 + 错题号        <- 你手打，最重要
-  2-答案/<课次>.txt     题号 + 答案 + 考点 + 题型    <- 你提供答案
-  3-照片/               改完的课测照片（文件名尽量 = 姓名.jpg，仅作核对/存档）
+  班级名单/<班级>.txt     姓名 + 分数 + 错题号        <- 你手打，最重要
+  课测答案/<课次>.txt     题号 + 答案 + 考点 + 题型    <- 你提供答案
+  照片/               改完的课测照片（文件名尽量 = 姓名.jpg，仅作核对/存档）
   课测答案/自定义练习/<班级>.txt 可选，有则覆盖模板生成
-  4-输出/<班级>_<课次>/ 一切产物
+  生成结果/<班级>_<课次>/ 一切产物
 
 用法：
-  python 课测反馈.py                     # 自动处理 1-名单 / 2-答案 里所有配对
+  python 课测反馈.py                     # 自动处理 班级名单 / 课测答案 里所有配对
   python 课测反馈.py --demo              # 生成示例输入并跑一遍（自检用）
   python 课测反馈.py --班级 五1班 --答案 第5讲L95-96
 """
@@ -46,7 +46,11 @@ except ImportError:
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _ws import fast_remove, workspace_root, photo_root, safe_name  # noqa: E402
+from roster import strip_id  # noqa: E402
+from fonts import docx_font_name  # noqa: E402
+ROOT = workspace_root()
 
 
 def set_workspace(base: Path):
@@ -54,7 +58,7 @@ def set_workspace(base: Path):
     global DIR_ROSTER, DIR_ANSWER, DIR_PHOTO, DIR_OUT, DIR_CUSTOM, DIR_HISTORY, HISTORY_CSV
     DIR_ROSTER = base / "班级名单"
     DIR_ANSWER = base / "课测答案"
-    DIR_PHOTO = base / "答题卡照片"
+    DIR_PHOTO = photo_root(base)
     DIR_OUT = base / "生成结果"
     DIR_CUSTOM = ROOT / "课测答案" / "自定义练习"
     DIR_HISTORY = base / "生成结果" / "历史"
@@ -149,6 +153,7 @@ def parse_roster(path: Path):
             continue
         # 姓名 + 分数 + 可选错题
         parts = [p for p in re.split(r"[\s,，\t]+", line) if p]
+        parts = strip_id(parts)          # 名单带学号时先摘掉
         if not parts:
             continue
         # 只写了姓名、没有分数 → 先记为「待定」，后面按有没有答题卡判定缺考
@@ -229,16 +234,24 @@ def load_section_deductions(answer_path: Path, cls_name: str = ""):
     if cls_name:
         lesson = ""
         try:
-            meta2, _ = parse_roster(next(
-                f for f in DIR_ROSTER.glob("*.txt") if cls_name in f.stem))
+            # 先精确匹配文件名，再退回子串——否则「五1班」会命中「五1班B」
+            _hit = next((f for f in DIR_ROSTER.glob("*.txt")
+                         if f.stem == cls_name), None) or next(
+                f for f in DIR_ROSTER.glob("*.txt") if cls_name in f.stem)
+            meta2, _ = parse_roster(_hit)
             lesson = meta2.get("课次", "")
         except Exception:
             pass
         if lesson:
-            cands.append(DIR_OUT / f"{cls_name}_{lesson}" / "大题扣分.json")
+            cands.append(DIR_OUT / f"{safe_name(cls_name)}_{safe_name(lesson)}"
+                         / "大题扣分.json")
         cands.append(DIR_OUT / cls_name / "大题扣分.json")
     cand = next((c for c in cands if c.exists()), None)
     if not cand:
+        # 没有分项扣分表就只能靠错题号反推，分项和薄弱项会不准。
+        # 最常见的原因：生成结果被清过，但 ingest 没重跑。
+        print("  [警告] 没找到「大题扣分.json」——分项只能按错题号估，"
+              "话术和报告的薄弱项可能不准。重跑一次 ingest 就会生成。")
         return {}
     try:
         raw = json.loads(cand.read_text(encoding="utf-8-sig"))
@@ -348,21 +361,28 @@ def build_stats(students, questions, meta=None):
     # 大题 -> 名称 / 题号区间。可由名单里的 @大题名称 与 @大题题数 覆盖，
     # 例如四年级 NCE1-L11-18：@大题名称: 名词复数,单项选择,选词填空,按要求改写句子,阅读理解
     #                        @大题题数: 5,20,5,5,5
-    KEYS = ("一", "二", "三", "四", "五")
-    _def_names = ["过去式/过去分词", "单项选择", "用适当形式填空",
-                  "按要求改写句子", "阅读理解"]
-    _def_counts = [5, 15, 5, 5, 5]
     _names = [x.strip() for x in re.split(r"[,，、]", meta.get("大题名称", "")) if x.strip()]
-    if len(_names) != 5:
-        _names = _def_names
+    if not _names:
+        # 没配大题名称时，绝不能套「过去式/单项选择」这种某个卷子的结构——
+        # 换成中性的「全部题目」，题数按实际题号总数算。
+        _names = ["全部题目"]
     _counts = []
     for x in re.split(r"[,，、]", meta.get("大题题数", "")):
         try:
             _counts.append(int(x.strip()))
         except ValueError:
             pass
-    if len(_counts) != 5 or sum(_counts) <= 0:
-        _counts = _def_counts
+    if not _counts or sum(_counts) <= 0:
+        _counts = [len(questions) or 30]
+    # 名字和题数必须一样长；题数不够就补 0，多了截掉，绝不换名字
+    while len(_counts) < len(_names):
+        _counts.append(0)
+    _counts = _counts[:len(_names)]
+    # 支持超过 5 个大题（原来 KEYS 只有五个，第 6 个会 IndexError）
+    # 超过十个就用阿拉伯数字，别让第 11 个大题把整批打断
+    _CN = "一二三四五六七八九十"
+    KEYS = tuple(_CN[i] if i < len(_CN) else str(i + 1)
+                 for i in range(len(_names)))
     SEC_NAME = dict(zip(KEYS, _names))
     SEC_RANGE = {}
     _cur = 1
@@ -391,7 +411,7 @@ def build_stats(students, questions, meta=None):
             s["大题扣分存疑"] = f"分项和 {got:g} ≠ 应扣 {need:g}"
             continue
         weak = []
-        for k in ("一", "二", "三", "四", "五"):
+        for k in KEYS:          # 不能写死五个：第六大题及以后会被漏掉
             v = float(d.get(k, 0) or 0)
             if v > 0:
                 a, b = SEC_RANGE[k]
@@ -452,7 +472,7 @@ def build_stats(students, questions, meta=None):
 # 照片索引
 # ============================================================
 def photo_dir_for(*candidates):
-    """按候选名依次查找分班照片目录，找不到就回退到 3-照片/ 根目录。
+    """按候选名依次查找分班照片目录，找不到就回退到 照片/ 根目录。
 
     候选顺序一般是：名单里的 @班级 字段 → 名单文件名。
     这样即使名单里把班级名写成了别的（如「五1班」而目录叫「周六10点」），
@@ -493,7 +513,7 @@ def load_photo_map(base=None):
 
 
 def load_name_alias():
-    """姓名对照表：答题卡/照片上的名字 -> 名单里的名字（1-名单/姓名对照.txt）。"""
+    """姓名对照表：答题卡/照片上的名字 -> 名单里的名字（班级名单/姓名对照.txt）。"""
     p = ROOT / "班级名单" / "姓名对照.txt"
     out = {}
     if not p.exists():
@@ -515,7 +535,7 @@ def index_photos(names, cls_name=None, roster_stem=None, lesson=None):
     """返回 {姓名: [照片路径]} 与未匹配照片名列表。
 
     照片可以放在班级目录下，也可以放在课次子目录里（如
-    3-照片\\周六10点\\五年级第五讲\\*.jpg）。若给了 lesson，优先只扫该课次子目录，
+    照片/周六10点/五年级第五讲/*.jpg）。若给了 lesson，优先只扫该课次子目录，
     避免不同课次的照片混在一起。
     """
     photos = defaultdict(list)
@@ -573,13 +593,16 @@ def index_photos(names, cls_name=None, roster_stem=None, lesson=None):
                 photos[who].append(f)
 
     # 3) 文件名里带姓名的（张三.jpg / 张三_1.jpg / 5.1张三.jpg）
-    #    也认姓名对照表（照片写本名「马泽文」、名单里是「马团团」）
+    #    也认姓名对照表（照片写本名「李明」、名单里是「李小明」）
     _alias = load_name_alias()
     for f in files:
         if any(f in v for v in photos.values()):
             continue
         stem = f.stem
-        hit = next((n for n in names if n in stem), None)
+        # 按名字长度倒序找：名单里同时有「张三」「张三丰」时，
+        # 「张三丰.jpg」必须配给张三丰，不能被张三先抢走
+        hit = next((n for n in sorted(names, key=len, reverse=True)
+                    if n in stem), None)
         if hit is None:
             hit = next((r for c, r in _alias.items()
                         if c in stem and r in names), None)
@@ -611,7 +634,12 @@ def archive_photos(outdir, ordered, photos):
         d.mkdir(parents=True, exist_ok=True)
         for i, f in enumerate(fs, 1):
             ext = f.suffix.lower()
-            shutil.copy2(f, d / f"{dn}_{i}{ext}")
+            try:
+                shutil.copy2(f, d / f"{dn}_{i}{ext}")
+            except OSError as e:
+                print(f"  [警告] 改名失败 {f.name}：{type(e).__name__}"
+                      f"（被占用？），这张跳过")
+                continue
             count += 1
     return count
 
@@ -622,8 +650,8 @@ def archive_photos(outdir, ordered, photos):
 THIN = Side(style="thin", color="BFBFBF")
 BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
 HEAD_FILL = PatternFill("solid", fgColor="1B5EA8")
-HEAD_FONT = Font(name="微软雅黑", size=10, bold=True, color="FFFFFF")
-BODY_FONT = Font(name="微软雅黑", size=10)
+HEAD_FONT = Font(name=docx_font_name(), size=10, bold=True, color="FFFFFF")
+BODY_FONT = Font(name=docx_font_name(), size=10)
 CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
 LEFT = Alignment(horizontal="left", vertical="center", wrap_text=True)
 
@@ -634,7 +662,7 @@ def write_xlsx(path, meta, students, questions, qmap, q_err, point_stat, cls, ph
     def head(ws, cols, widths, title):
         ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(cols))
         c = ws.cell(row=1, column=1, value=title)
-        c.font = Font(name="微软雅黑", size=13, bold=True, color="1B5EA8")
+        c.font = Font(name=docx_font_name(), size=13, bold=True, color="1B5EA8")
         c.alignment = CENTER
         ws.row_dimensions[1].height = 28
         for i, (name, w) in enumerate(zip(cols, widths), 1):
@@ -676,7 +704,7 @@ def write_xlsx(path, meta, students, questions, qmap, q_err, point_stat, cls, ph
             cell.font = BODY_FONT
             cell.border = BORDER
             cell.alignment = LEFT if i in (5, 6, 8) else CENTER
-        ws.cell(row=r, column=2).font = Font(name="微软雅黑", size=10, bold=True,
+        ws.cell(row=r, column=2).font = Font(name=docx_font_name(), size=10, bold=True,
                                              color="%02X%02X%02X" % s.get("颜色", (0, 0, 0)))
         if s.get("错题未知"):
             for i in range(1, len(cols) + 1):
@@ -693,12 +721,12 @@ def write_xlsx(path, meta, students, questions, qmap, q_err, point_stat, cls, ph
         ("及格率", f"{cls['及格率']}%（≥{cls.get('及格线', 60):g}分）"),
         ("优秀率", f"{cls['优秀率']}%（≥{cls.get('满分',100)*0.9:g}分）"),
     ]
-    ws.cell(row=r, column=1, value="班级统计").font = Font(name="微软雅黑", size=11, bold=True, color="1B5EA8")
+    ws.cell(row=r, column=1, value="班级统计").font = Font(name=docx_font_name(), size=11, bold=True, color="1B5EA8")
     r += 1
     for k, v in stats_rows:
         ws.cell(row=r, column=1, value=k).font = BODY_FONT
         c = ws.cell(row=r, column=2, value=v)
-        c.font = Font(name="微软雅黑", size=10, bold=True)
+        c.font = Font(name=docx_font_name(), size=10, bold=True)
         c.alignment = CENTER
         r += 1
 
@@ -758,7 +786,7 @@ def write_xlsx(path, meta, students, questions, qmap, q_err, point_stat, cls, ph
         r += 1
     if unmatched:
         r += 1
-        ws4.cell(row=r, column=1, value="未匹配到学生的照片：").font = Font(name="微软雅黑", size=10, bold=True, color="C0392B")
+        ws4.cell(row=r, column=1, value="未匹配到学生的照片：").font = Font(name=docx_font_name(), size=10, bold=True, color="C0392B")
         ws4.cell(row=r, column=4, value="；".join(unmatched)).alignment = LEFT
 
     # --- Sheet5 识别核对（照片与识别结果并排，供老师一眼复核）---
@@ -768,8 +796,8 @@ def write_xlsx(path, meta, students, questions, qmap, q_err, point_stat, cls, ph
 
         ws5 = wb.create_sheet("识别核对")
         ws5.merge_cells("A1:H1")
-        c = ws5.cell(row=1, column=1, value="识别结果核对表 —— 请对照右侧照片逐个核对姓名/分数/错题号，发现不对直接改「1-名单」后重跑")
-        c.font = Font(name="微软雅黑", size=12, bold=True, color="C0392B")
+        c = ws5.cell(row=1, column=1, value="识别结果核对表 —— 请对照右侧照片逐个核对姓名/分数/错题号，发现不对直接改「班级名单」后重跑")
+        c.font = Font(name=docx_font_name(), size=12, bold=True, color="C0392B")
         c.alignment = CENTER
         ws5.row_dimensions[1].height = 26
         heads5 = ["姓名", "分数", "错题号", "核对", "试卷照片（缩放显示，以原件为准）"]
@@ -816,23 +844,27 @@ def write_xlsx(path, meta, students, questions, qmap, q_err, point_stat, cls, ph
                     ws5.row_dimensions[row].height = max(img_h_pts, 20)
                     if len(fs) > 1:
                         ws5.cell(row=row, column=6,
-                                 value=f"+{len(fs)-1}张").font = Font(name="微软雅黑", size=9, color="1B5EA8")
+                                 value=f"+{len(fs)-1}张").font = Font(name=docx_font_name(), size=9, color="1B5EA8")
                 except Exception as e:
                     ws5.cell(row=row, column=5, value=f"[图片嵌入失败: {e}]").font = BODY_FONT
             else:
                 ws5.cell(row=row, column=5, value="（未匹配到照片）").font = Font(
-                    name="微软雅黑", size=9, color="999999")
+                    name=docx_font_name(), size=9, color="999999")
             row += 1
     except ImportError:
         pass  # 没装 Pillow 就跳过该 Sheet，不影响其他产物
 
-    wb.save(path)
-    # 清理临时缩略图
-    for t in path.parent.glob("_tmp_*.png"):
-        try:
-            t.unlink()
-        except OSError:
-            pass
+    try:
+        wb.save(path)
+    except PermissionError:
+        alt = path.with_name(path.stem + "_新" + path.suffix)
+        wb.save(alt)
+        print(f"  [注意] {path.name} 正被 Excel 打开，已另存为 {alt.name}；"
+              f"关掉 Excel 后重跑就能覆盖回原名")
+    # 清理临时缩略图（一次删完，别逐个 unlink）
+    _tmps = list(path.parent.glob("_tmp_*.png"))
+    if _tmps:
+        fast_remove(*_tmps)
     return path
 
 
@@ -852,6 +884,28 @@ def _pct_text(errors, total):
     return "失分较多"
 
 
+def _student_points(s, qmap, limit=4):
+    """这个孩子这次错的题 → 考点列表（去重、按出现顺序）。
+
+    每讲考点都不一样，所以任何地方都不能写死考点名，必须从这里取。
+    比 w["名称"]（模块名，如「单项选择」）更具体 —— 家长看得懂
+    「现在完成时·How long」是什么，看不懂「单项选择」。
+    """
+    out = []
+    for q in (s.get("错题") or []):
+        a = qmap.get(q) or {}
+        kp = str(a.get("考点") or "").strip()
+        if not kp:
+            continue
+        for atom in re.split(r"[,，、]", kp):
+            atom = atom.strip()
+            if atom and atom not in out:
+                out.append(atom)
+        if len(out) >= limit:
+            break
+    return out[:limit]
+
+
 def make_feedback(s, cls, qmap, meta, trend=""):
     """生成一个孩子的家长反馈 —— 口语化，像微信里直接跟家长说的话。
 
@@ -862,7 +916,7 @@ def make_feedback(s, cls, qmap, meta, trend=""):
       3. 任务必须是低成本可执行的（3分钟能完成），不写"每天5分钟连做3天"。
     """
     name = s["姓名"]
-    # 名单/照片里的排序前缀（如"A李怀森"）不进入家长话术
+    # 名单/照片里的排序前缀（如"A李小明"）不进入家长话术
     disp_name = re.sub(r"^[A-Za-z](?=[\u4e00-\u9fff])", "", name) or name
     # 称呼：叫名字后两个字；两字名（或更短）就叫全名
     short = disp_name[-2:] if len(disp_name) > 2 else disp_name
@@ -882,16 +936,26 @@ def make_feedback(s, cls, qmap, meta, trend=""):
     ptitle = meta.get("称呼") or "家长"
     warm = meta.get("家长风格") == "亲和"      # 低龄段：更软、多鼓励
 
+    # ---------- 进步版：这次重点说「做对了什么」 ----------
+    _prog = [x.strip() for x in re.split(r"[,，、]", meta.get("进步学生", "")) if x.strip()]
+    if s["姓名"] in _prog:
+        return make_progress_feedback(s, meta, short, ptitle, exam, score_txt)
+
+    # ---------- 退步版：承认落差、找原因，不追责 ----------
+    _slip = [x.strip() for x in re.split(r"[,，、]", meta.get("退步学生", "")) if x.strip()]
+    if s["姓名"] in _slip:
+        return make_slip_feedback(s, meta, short, ptitle, exam, score_txt)
+
     # ---------- 特殊学生：专属话术（如「依赖带读型」）----------
     _special = [x.strip() for x in re.split(r"[,，、]", meta.get("特殊学生", "")) if x.strip()]
     if s["姓名"] in _special:
-        return make_special_feedback(s, meta, short, ptitle, exam, score_txt)
+        return make_special_feedback(s, meta, short, ptitle, exam, score_txt, trend)
     _firm = [x.strip() for x in re.split(r"[,，、]", meta.get("严正学生", "")) if x.strip()]
     if s["姓名"] in _firm:
-        return make_firm_feedback(s, meta, short, ptitle, exam, score_txt)
+        return make_firm_feedback(s, meta, short, ptitle, exam, score_txt, trend)
     _reassure = [x.strip() for x in re.split(r"[,，、]", meta.get("安心学生", "")) if x.strip()]
     if s["姓名"] in _reassure or meta.get("家长风格") == "安抚":
-        return make_reassuring_feedback(s, meta, short, ptitle, exam, score_txt)
+        return make_reassuring_feedback(s, meta, short, ptitle, exam, score_txt, trend)
 
     wrong = s["错题"] or []
     n_wrong = len(wrong)
@@ -919,7 +983,7 @@ def make_feedback(s, cls, qmap, meta, trend=""):
                    f"{short}这次考了 {score_txt}，这一讲学得挺扎实的。"]
         elif pct >= 70:
             msg = [f"{short}{ptitle}您好！{exam}改完啦，我跟您说说{short}这次的表现。"
-                   f"{short}考了 {score_txt}，大部分内容都掌握住了。"]
+                   f"{short}考了 {score_txt}，基础是有的，就是有几处还松着。"]
         else:
             msg = [f"{short}{ptitle}您好！{exam}改完啦，我跟您聊聊{short}这次的情况。"
                    f"{short}这次考了 {score_txt}。"]
@@ -931,7 +995,7 @@ def make_feedback(s, cls, qmap, meta, trend=""):
                f"{short}这次 {score_txt}，这个成绩在班里是很好的。"]
     elif pct >= 70:
         msg = [f"{short}{ptitle}您好，{exam}改完了，跟您说说情况。"
-               f"{short}这次考了 {score_txt}，该拿的分基本都拿到了。"]
+               f"{short}这次考了 {score_txt}，基础是在的，但有几处明显松了。"]
     else:
         msg = [f"{short}{ptitle}您好，{exam}改完了，跟您说说情况。"
                f"{short}这次考了 {score_txt}。"]
@@ -939,9 +1003,9 @@ def make_feedback(s, cls, qmap, meta, trend=""):
         msg.append(trend)
 
     # ---------- 先夸：说具体做到了什么（不空夸）----------
-    ALL_SECS = tuple(meta.get("_sec_names") or
-                     ("过去式/过去分词", "单项选择", "用适当形式填空",
-                      "按要求改写句子", "阅读理解"))
+    # 拿不到真实大题名就留空——绝不能套「过去式/过去分词」这种某个卷子的结构，
+    # 否则别的讲次会对家长说「过去式那块一道没错」，而卷子根本没考。
+    ALL_SECS = tuple(meta.get("_sec_names") or ())
     weak_names_set = {w["名称"] for w in sec_weak}
     full_secs = [nm for nm in ALL_SECS if nm not in weak_names_set]
 
@@ -968,7 +1032,7 @@ def make_feedback(s, cls, qmap, meta, trend=""):
                    f"不过分得比较散，最多的一块也就 {worst:g} 分，"
                    f"说明不是完全没会，是几个点还没顾上。"
                    if warm else
-                   f"这张卷子五个题型都扣了点分，不过分得比较散，"
+                   f"这张卷子每个题型都扣了点分，不过分得比较散，"
                    f"最多的一块也就 {worst:g} 分，说明基础不算差，"
                    f"是几个点还没顾上。")
     elif s["亮点"] and not unknown:
@@ -1052,7 +1116,7 @@ def make_feedback(s, cls, qmap, meta, trend=""):
     elif unknown:
         msg.append("这次卷面细节我还在整理，先跟您同步分数，"
                    "具体的薄弱点我下节课当面跟孩子过。")
-    elif n_wrong == 0:
+    elif n_wrong == 0 and total_ded <= 0:
         msg.append("这次没有失分点。课测只能说明当下会了，"
                    "过两周还能记住才算真掌握，这块我课上会再带一遍。")
 
@@ -1068,13 +1132,14 @@ def make_feedback(s, cls, qmap, meta, trend=""):
         msg.append("这次扣的都是知识点没记牢，没有粗心丢分，"
                    "把该记的记住，分数就上来了。")
 
-    # ---------- 分层作业 ----------
-    # 低于重点线 → 发《专项练习_10题》（5 选择 + 5 句型转换，带答案页）
-    # 其余学生   → 发《背诵单_巩固版》（不规则动词 + 重点句型，不背单词）
-    RECITE = "《背诵单》（附件，动词的过去式和过去分词 + 本讲重点句型）"
-    PRACTICE = "《专项练习》（附件，10 道题，最后一页有答案）"
+    # ---------- 附件：统一是「巩固练习」 ----------
+    # 按他这次错的出的：前面是要背的几处，中间几道题，最后一页答案。
+    # 不再区分「背诵单 / 专项练习」——那是旧产物，主流程已经不出了；
+    # 也不再写死「动词的过去式和过去分词」这种某个讲次才有的内容。
     personal = meta.get("任务模式") == "个人小任务"
-    TASK = f"《{short}的小任务》（附件）"
+    # 不写具体文件名：附件实际叫「林小满.docx」，写成《小满的巩固练习》
+    # 老师会拿着话术去群里找这个标题，找不到还以为没发出去。
+    TASK = "练习（附件）"
 
     if personal and score is not None and score < focus_line:
         msg.append(f"我把孩子这次错的地方都整理出来了，做成了一份{TASK}，"
@@ -1084,33 +1149,27 @@ def make_feedback(s, cls, qmap, meta, trend=""):
         msg.append(f"我把孩子这次要记的东西整理成了一份{TASK}，"
                    f"就是几个词和句型，读一读、背一背就行，不用写。")
         msg.append("让孩子先自己过一遍，我下节课抽背，说给我听就行。")
-    elif score is not None and score < focus_line:
-        picked = [w for w in sec_weak if w["扣分"] >= 2][:2] or sec_weak[:1]
-        names = {w["名称"] for w in picked}
-        items = []
-        if names & {"单项选择", "用适当形式填空", "过去式/过去分词"}:
-            items.append("选择题 5 道（练 for、since、just、last 这几个标志词）")
-        if names & {"按要求改写句子"}:
-            items.append("句型转换 5 道（否定句、疑问句的语序）")
-        if not items:
-            items.append("选择题 5 道、句型转换 5 道")
-        items = items[:2]
-        msg.append(f"我给孩子准备了一份{PRACTICE}，就 10 道题：\n"
-                   + "\n".join(f"{i}. {t}" for i, t in enumerate(items, 1)))
-        msg.append("十几分钟就能做完，做完拍张照发我就行，我批完跟您说。")
     elif score is not None and pct >= 85:
-        msg.append(f"{short}这次基础很稳，我给孩子准备的是背的部分，"
-                   f"{RECITE}，不用刷题：\n"
-                   "1. 那几个动词的过去式和过去分词（return、have、cost、fly、sell），"
-                   "看着原形能说出后面两个形式，下节课我抽背；\n"
-                   "2. 本讲重点句型——How long、How soon、for 加时间段、since 加时间点，"
-                   "每个自己造两句，下节课说给我听。")
-        msg.append("这些课上基本都会了，回家巩固一下就好，不用额外做题。")
+        # 背诵内容按「这个孩子实际错的题 → 考点」生成，比模块名具体得多。
+        # 「现在完成时·How long」家长看得懂；「单项选择」看不出该背什么。
+        kps = _student_points(s, qmap)
+        if kps:
+            body = "\n".join(f"{i}. {k} —— 把这次错的记准，下节课我抽背"
+                             for i, k in enumerate(kps[:3], 1))
+        else:
+            _kp = "、".join(w["名称"] for w in sec_weak[:2]) or "这次错的那几处"
+            body = f"1. {_kp}——把这次错的地方记准，下节课我抽背"
+        msg.append(f"{short}这次基础很稳，我给孩子准备了一份{TASK}，"
+                   f"前面是要背的几处，后面几道题：\n{body}\n"
+                   f"顺手把后面那几道题做了，做完拍给我看。")
+        msg.append("这些课上基本都会了，回家巩固一下就好，不用额外加量。")
     else:
-        msg.append(f"我给孩子准备了一份{RECITE}，"
-                   f"动词的过去式和过去分词，加上这讲的几个重点句型，"
-                   f"读一读、背一背就行，不用写。")
-        msg.append("错的那几道我下节课带着孩子当面过一遍，不用您操心。")
+        kps = _student_points(s, qmap)
+        tail = ("，重点是：" + "、".join(kps[:3])) if kps else ""
+        msg.append(f"我给孩子准备了一份{TASK}{tail}，"
+                   f"前面几处读一读、背一背就行，不用写。")
+        msg.append("后面几道题都是他这次错的类型，做完拍张照发我就行。")
+
 
     # ---------- 收尾（短、暖）----------
     if score is not None and score < focus_line:
@@ -1182,18 +1241,24 @@ def make_sibling_feedback(members, cls, qmap, meta):
     names = [bare(m) for m in members]
     shorts = [short_of(m) for m in members]
 
-    # 称呼：去掉共同姓氏后拼接，如 谷佳禾/谷佳音 → 佳禾佳音家长
+    # 称呼：去掉共同姓氏后拼接，如 张小明/张小华 → 小明小华家长
     n1, n2 = names[0], names[1]
     if len(n1) > 2 and len(n2) > 2 and n1[0] == n2[0]:
         call = f"{n1[1:]}{n2[1:]}{ptitle}"
     else:
         call = f"{n1}{n2}{ptitle}"
 
-    pairs = "、".join(f"{nm} {m['分数']:g}/{FULL:g}" for nm, m in zip(names, members))
+    _bits = []
+    for _nm, _m in zip(names, members):
+        _sc = _m.get("分数")
+        _bits.append(f"{_nm} 缺考/{FULL:g}" if _sc is None
+                     else f"{_nm} {_sc:g}/{FULL:g}")
+    pairs = "、".join(_bits)
 
     # ---- 消息1：打招呼 + 报分 ----
     if reassure:
-        avg = sum(m["分数"] for m in members) / len(members)
+        _vals = [m["分数"] for m in members if m.get("分数") is not None]
+        avg = sum(_vals) / len(_vals) if _vals else 0.0
         if avg / FULL >= 0.75:
             m1 = (f"{call}您好！{exam}改完啦，两个孩子的成绩都出来了——{pairs}。\n"
                   f"整体都拿住了大部分内容，剩下几个点慢慢补就行，不用着急。")
@@ -1211,16 +1276,24 @@ def make_sibling_feedback(members, cls, qmap, meta):
     # ---- 消息2：逐个孩子 ----
     segs = []
     for m, nm, sh in zip(members, names, shorts):
+        # 双胞胎里一个没来考：别给他编练习，也别让家长以为他也考了
+        if m.get("缺考") or m.get("分数") is None:
+            segs.append(f"{sh}这次没来考，卷子我留着，下节课单独给他补，不影响进度。")
+            continue
         mine = list(per.get(nm) or per.get(m["显示名"]) or [])
+        if not mine:
+            # 没配 @逐人知识点、也没有知识点库时，用他自己的薄弱大题顶上。
+            # 否则这里只剩一句「我再单独跟您说」，家长看完等于什么都没得到。
+            mine = [w["名称"] for w in (m.get("薄弱大题") or []) if w.get("名称")]
         if len(mine) < 3:
             for k in common:
                 if len(mine) >= 3:
                     break
                 if k not in mine:
                     mine.append(k)
-        if lib and mine:
-            shs = [lib.SHORT.get(k, k) for k in mine[:3]]
-            tip = lib.TIP.get(mine[0], "")
+        if mine:
+            shs = [lib.SHORT.get(k, k) for k in mine[:3]] if lib else mine[:3]
+            tip = lib.TIP.get(mine[0], "") if lib else ""
             if reassure:
                 piece = (f"{sh}这边，上课是跟得住的，要补的主要是{'、'.join(shs[:2])}。")
                 if tip:
@@ -1234,18 +1307,19 @@ def make_sibling_feedback(members, cls, qmap, meta):
             piece = f"{sh}这边我再单独跟您说。"
 
         if personal:
-            piece += (f"我给孩子整理了一份《{sh}的小任务》（附件），"
-                      f"就 {len(mine) or 5} 件事，一天五分钟过一遍就够了。")
+            piece += (f"我给孩子整理了一份练习（附件），"
+                      f"就 {(len(mine) or 3)} 件事，一天五分钟过一遍就够了。")
         else:
-            piece += "我准备了一份小练习，量很小，一天五分钟就够了。"
+            piece += "我整理了一份练习（附件），量很小，一天五分钟就够了。"
         segs.append(piece)
 
     # 表扬 / 点名提示
     praise = [x.strip() for x in re.split(r"[,，、]", meta.get("表扬学生", "")) if x.strip()]
     for m, sh in zip(members, shorts):
         if m["姓名"] in praise:
-            segs.append(f"另外，{sh}有一点我要专门表扬一下——按要求改写句子那道大题，"
-                        f"孩子写得挺好，说明句型是听懂了、也用上了。这是实打实的进步。")
+            segs.append(f"另外，{sh}有一点我要专门表扬一下——"
+                        f"这次的状态是稳的，该拿的分基本都拿到了。"
+                        f"这是实打实的进步。")
 
     notice = meta.get("点名提示", "")
     for item in re.split(r"[；;]", notice):
@@ -1259,7 +1333,7 @@ def make_sibling_feedback(members, cls, qmap, meta):
 
     # ---- 消息3：收尾 ----
     if reassure:
-        m3 = ("四年级这个阶段，比分数更要紧的是习惯。两个孩子我课上都会多带着，"
+        m3 = ("这个阶段，比分数更要紧的是习惯。两个孩子我课上都会多带着，"
               "您在家不用着急，跟着过一遍就行。有情况随时找我。")
     else:
         m3 = "两个孩子我课上都会盯着，您在家不用着急。有情况随时找我。"
@@ -1267,7 +1341,7 @@ def make_sibling_feedback(members, cls, qmap, meta):
     parts = [x for x in (m1, m2, m3) if x.strip()]
     return "\n---SPLIT---\n".join(parts)
 
-def set_run_font(run, name="微软雅黑", size=10.5, bold=False, color=None):
+def set_run_font(run, name=docx_font_name(), size=10.5, bold=False, color=None):
     run.font.name = name
     run.font.size = Pt(size)
     run.bold = bold
@@ -1285,9 +1359,9 @@ def set_run_font(run, name="微软雅黑", size=10.5, bold=False, color=None):
 def write_feedback_docx(path, ordered, texts, meta, cls):
     doc = Document()
     st = doc.styles["Normal"]
-    st.font.name = "微软雅黑"
+    st.font.name = docx_font_name()
     st.font.size = Pt(10.5)
-    st.element.rPr.rFonts.set(qn("w:eastAsia"), "微软雅黑")
+    st.element.rPr.rFonts.set(qn("w:eastAsia"), docx_font_name())
 
     h = doc.add_paragraph()
     h.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -1362,8 +1436,8 @@ def write_feedback_txt(path, ordered, texts, meta):
 def write_practice_docx(path, questions, q_err, point_stat, cls, meta, custom_text=None):
     doc = Document()
     st = doc.styles["Normal"]
-    st.font.name = "微软雅黑"
-    st.element.rPr.rFonts.set(qn("w:eastAsia"), "微软雅黑")
+    st.font.name = docx_font_name()
+    st.element.rPr.rFonts.set(qn("w:eastAsia"), docx_font_name())
 
     h = doc.add_paragraph()
     h.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -1433,7 +1507,7 @@ def write_practice_docx(path, questions, q_err, point_stat, cls, meta, custom_te
         tips = {
             "听写": "用本讲单词表，请家长报中文，你写英文，注意首字母大小写和拼写完整性。",
             "单词拼写": "用本讲单词表，请家长报中文，你写英文，写完自己逐个字母核对一遍。",
-            "句型转换": "按「一定、二变、三问号」三步走：先定特殊疑问词，再变一般疑问句语序，最后补问号。",
+            "句型转换": "按「一定、二变、三问号」三步走：先定特殊疑问词，再变一般疑问句语序，最后补问号。",  # hc-ok 题型名通用
             "选择题": "把四个选项逐一代回原句读一遍，用「读得通不通顺」排除两个，再用语法点定最后一个。",
             "翻译": "先定主谓，再补时间地点，最后检查时态和单复数。",
             "阅读理解": "回到原文找依据句，把依据句划出来再选，不要凭印象。",
@@ -1492,9 +1566,21 @@ def save_history(meta, students):
                 key = (row.get("班级", ""), row.get("课次", ""), row.get("姓名", ""))
                 seen[key] = row
     for s in students:
-        if s["缺考"] or s["分数"] is None:
-            continue
         key = (meta.get("班级", ""), meta.get("课次", ""), s["姓名"])
+        if s["缺考"] or s["分数"] is None:
+            # 缺考也要留一行，汇总表才能把这一次标成「缺考」而不是空白
+            seen[key] = {
+                "日期": meta.get("日期", "") or _dt.date.today().isoformat(),
+                "班级": meta.get("班级", ""),
+                "课次": meta.get("课次", ""),
+                "姓名": s["姓名"],
+                "分数": "",
+                "档位": "缺考",
+                "错题数": "",
+                "薄弱考点": "",
+                "状态": "缺考",
+            }
+            continue
         seen[key] = {
             "日期": meta.get("日期", "") or _dt.date.today().isoformat(),
             "班级": meta.get("班级", ""),
@@ -1504,10 +1590,12 @@ def save_history(meta, students):
             "档位": s["档位"],
             "错题数": len(s["错题"]),
             "薄弱考点": s["错题考点"],
+            "状态": "",
         }
     rows = list(seen.values())
     with HISTORY_CSV.open("w", encoding="utf-8-sig", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["日期", "班级", "课次", "姓名", "分数", "档位", "错题数", "薄弱考点"])
+        w = csv.DictWriter(f, fieldnames=["日期", "班级", "课次", "姓名", "分数",
+                                          "档位", "错题数", "薄弱考点", "状态"])
         w.writeheader()
         for r in rows:
             w.writerow({k: r.get(k, "") for k in w.fieldnames})
@@ -1520,7 +1608,8 @@ def trend_of(name, cls_name, meta, hist, score):
             for (l, s) in lst if l != meta.get("课次", "")]
     if not past:
         return ""
-    past.sort(key=lambda x: x[0])
+    # 不按课次名字符串排：那样「第10讲」会排到「第9讲」前面
+    # hist 里的顺序就是成绩历史.csv 的追加顺序，最后一条才是最近的
     last_lesson, last_score = past[-1]
     d = score - last_score
     if abs(d) < 0.5:
@@ -1745,6 +1834,15 @@ def process(roster_path: Path, answer_path: Path, custom_path: Path | None):
     if auto_absent:
         print(f"  名单中有但无答题卡，按缺考处理：{'、'.join(auto_absent)}")
 
+    # 一个人都没登分 → 大概率是「还没跑 ingest 就点了生成」。
+    # 这时候如果继续，会把全班标成缺考写进 成绩历史.csv，污染进步曲线，
+    # 而且老师看到的是「全班缺考」的成绩表，会以为程序坏了。
+    if not any((s["分数"] is not None and not s["缺考"]) for s in students):
+        print("[错] 这份名单里一个分数都没有 —— 还没有登分。")
+        print("     先把答题卡读成 readings.json，跑一次 ingest.py 登分，再生成。")
+        print("     （这次什么都没写，成绩历史没有被污染）")
+        raise SystemExit(2)
+
     total, qmap, q_err, point_stat, cls = build_stats(students, questions, meta)
 
     # ---------- 知识点定位（可选：名单里写 @知识点库: L11-18）----------
@@ -1783,10 +1881,14 @@ def process(roster_path: Path, answer_path: Path, custom_path: Path | None):
         if s["缺考"] or s["分数"] is None:
             continue
         tr = trend_of(s["姓名"], meta.get("班级", ""), meta, hist, s["分数"])
+        _past = [sc2 for (c2, n3), lst2 in hist.items()
+                 if c2 == meta.get("班级", "") and n3 == s["姓名"]
+                 for (l2, sc2) in lst2 if l2 != meta.get("课次", "")]
+        s["_上次分数"] = _past[-1] if _past else None
         texts[s["显示名"]] = make_feedback(s, cls, qmap, meta, tr)
 
     # ---------- 双胞胎/兄弟姐妹：合并成一份话术 ----------
-    # 名单里写 @同家长: 江宇婷,江宇晴  即可自动合并
+    # 名单里写 @同家长: 江小红,江小晴  即可自动合并
     sib_groups = []
     raw_sib = meta.get("同家长") or meta.get("双胞胎") or ""
     for grp in re.split(r"[；;]", raw_sib):
@@ -1795,7 +1897,7 @@ def process(roster_path: Path, answer_path: Path, custom_path: Path | None):
             sib_groups.append(names)
 
     for names in sib_groups:
-        # 按名单里写的顺序取成员（决定称呼顺序，如"江宇婷,江宇晴"）
+        # 按名单里写的顺序取成员（决定称呼顺序，如"江小红,江小晴"）
         members = []
         for nm in names:
             hit = [s for s in students if s["显示名"] == nm or s["姓名"] == nm]
@@ -1807,10 +1909,16 @@ def process(roster_path: Path, answer_path: Path, custom_path: Path | None):
         if not combined:
             continue
         # 合并后挂在第一个孩子名下，其余孩子话术清空（避免重复发送）
-        key0 = members[0]["显示名"]
+        # 挂在第一个「真考了」的孩子名下：一个缺考一个没缺时，
+        # 挂在缺考那个身上会让这条话术进不了群发
+        _anchor = next((m for m in members
+                        if not m.get("缺考") and m.get("分数") is not None),
+                       members[0])
+        key0 = _anchor["显示名"]
         texts[key0] = combined
-        for m in members[1:]:
-            texts.pop(m["显示名"], None)
+        for m in members:
+            if m["显示名"] != key0:
+                texts.pop(m["显示名"], None)
         print(f"  双胞胎合并话术：{'、'.join(m['显示名'] for m in members)}")
 
     # 话术/分发只保留有效学生
@@ -1819,7 +1927,18 @@ def process(roster_path: Path, answer_path: Path, custom_path: Path | None):
     for i, s in enumerate(ordered, 1):
         s["名次"] = i  # 内部用，不写进话术
 
-    outdir = DIR_OUT / f"{meta['班级']}_{meta['课次']}".replace("/", "_")
+    # ---------- 统一附言（名单里 @附言: 下次课调周六下午两点）----------
+    # 有的讲次要给全班加同一句话：下次课时间、考试范围、要带什么书。
+    # 加在最后一条消息末尾，不新增第四条——群发表只有 3 个文本列。
+    _fy = (meta.get("附言") or "").strip()
+    if _fy:
+        for _k in list(texts):
+            _t0 = (texts[_k] or "").rstrip()
+            texts[_k] = (_t0 + "\n" + _fy) if _t0 else _fy
+
+    # 统一走 safe_name：班名/课次里带 : * ? | 时 Windows 建目录会失败，
+    # 而且归档那边用的是 safe_name，两边不一致就会「找不到产物」
+    outdir = DIR_OUT / f"{safe_name(meta['班级'])}_{safe_name(meta['课次'])}"
     outdir.mkdir(parents=True, exist_ok=True)
 
     custom_text = custom_path.read_text(encoding="utf-8-sig") if custom_path and custom_path.exists() else None
@@ -1829,16 +1948,67 @@ def process(roster_path: Path, answer_path: Path, custom_path: Path | None):
     p1 = write_xlsx(outdir / "课测成绩表.xlsx", meta, students, questions, qmap, q_err, point_stat, cls, photos, unmatched)
     p2 = write_feedback_docx(outdir / "家长反馈话术.docx", ordered, texts, meta, cls)
     p3 = write_feedback_txt(outdir / "家长反馈话术.txt", ordered, texts, meta)
-    p4 = write_practice_docx(outdir / "错题专项小练习.docx", questions, q_err, point_stat, cls, meta, custom_text)
+    # 错题专项小练习：主流程早就不用它了（群发拿的是巩固单）。
+    # 只有老师自己传了 --练习（一份自编材料）时才生成，否则纯属多写一个没人看的文件。
+    if custom_text:
+        write_practice_docx(outdir / "错题专项小练习.docx",
+                            questions, q_err, point_stat, cls, meta, custom_text)
     p5 = write_report(outdir / "汇总报告.md", meta, students, questions, q_err, point_stat, cls, unmatched, texts)
     n_hist = save_history(meta, students)
+
+    # ---- 话术版本建议：算出哪些孩子值得单独问老师 ----
+    # 判据只用两条：考得差（低于 70%）、跟上次比变化大（±15% 满分）
+    # 第一次课测没有历史，就只有「考得差」这一条
+    def _last_score(nm):
+        past = [(l, sc) for (c, n2), lst in hist.items()
+                if c == meta.get("班级", "") and n2 == nm
+                for (l, sc) in lst if l != meta.get("课次", "")]
+        return past[-1][1] if past else None
+
+    _full = float(meta.get("满分") or cls.get("满分") or 40)
+    suggest = []
+    for s0 in ordered:
+        _sc = s0["分数"]
+        _pct = _sc / _full if _full else 0
+        _last = _last_score(s0["姓名"])
+        _d = (_sc - _last) if _last is not None else None
+        _why = []
+        if _pct < 0.7:
+            _why.append(f"得分率 {_pct:.0%}，{s0['档位']}")
+        if _d is not None:
+            _r = _d / _full
+            if _r >= 0.15:
+                _why.append(f"比上次（{_last:g}）进步 {_d:g} 分")
+            elif _r <= -0.15:
+                _why.append(f"比上次（{_last:g}）退步 {abs(_d):g} 分")
+        if _why:
+            suggest.append({
+                "姓名": s0["显示名"],
+                "分数": f"{_sc:g}/{_full:g}",
+                "得分率": round(_pct * 100),
+                "档位": s0["档位"],
+                "上次": f"{_last:g}" if _last is not None else "",
+                "变化": (("+" if _d >= 0 else "") + f"{_d:g}") if _d is not None else "",
+                "原因": "；".join(_why),
+            })
+
+    if suggest:
+        import json as _json
+        _sp = outdir / "话术建议.json"
+        _sp.write_text(_json.dumps(
+            {"班级": meta.get("班级", ""), "课次": meta.get("课次", ""),
+             "建议": suggest}, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"\n  [话术建议] 这 {len(suggest)} 个孩子要不要换个说法，问一下老师：")
+        for _x in suggest:
+            print(f"    {_x['姓名']:<6}{_x['分数']:>9}　{_x['档位']}　{_x['原因']}")
+        print(f"    → {_sp}")
 
     print(f"\n{'='*64}")
     print(f"✓ {meta['班级']} {meta['课次']} 处理完成")
     print(f"  人数 {cls['人数']} | 有效 {cls['有效']} | 平均 {cls['平均分']} | "
           f"最高 {cls['最高']} | 最低 {cls['最低']} | 及格率 {cls['及格率']}% | 优秀率 {cls['优秀率']}%")
     print(f"  输出目录：{outdir}")
-    for p in (p1, p2, p3, p4, p5):
+    for p in (p1, p2, p3, p5):
         print(f"    - {p.name}")
     if unmatched:
         print(f"  [提示] {len(unmatched)} 张照片未匹配到学生：{'、'.join(unmatched[:5])}")
@@ -1852,6 +2022,7 @@ def process(roster_path: Path, answer_path: Path, custom_path: Path | None):
     return outdir
 
 
+# hc-demo-start
 def make_demo():
     DIR_ROSTER.mkdir(parents=True, exist_ok=True)
     DIR_ANSWER.mkdir(parents=True, exist_ok=True)
@@ -1889,6 +2060,7 @@ def make_demo():
         "王十二 73 1,3,7,10\n",
         encoding="utf-8")
     return DIR_ROSTER / "五1班.txt", DIR_ANSWER / "第5讲L95-96.txt"
+# hc-demo-end
 
 
 def main():
@@ -1929,8 +2101,8 @@ def main():
         return
     # 没答案文件也能跑：识别照片已给出各大题扣分，够定位知识点了
     if not answers:
-        print("[提示] 2-答案 里没有答案文件 —— 将只按各大题扣分生成，"
-              "不做逐题错题练习。")
+        print("[提示] 课测答案 里没有这讲的答案 —— 只按各大题扣分出，"
+              "不定位到具体考点。")
 
     ok = 0
     skipped = []
@@ -1962,7 +2134,93 @@ def main():
     print(f"全部完成：成功 {ok} 个班。")
 
 
-def make_special_feedback(s, meta, short, ptitle, exam, score_txt):
+def make_slip_feedback(s, meta, short, ptitle, exam, score_txt, trend=""):
+    """退步版：这次明显掉下来，但孩子本身没问题。
+
+    重点是「承认落差 + 找原因 + 给一个能做的动作」，不是追责。
+    家长看到分数掉了本来就慌，第一句先把这层安抚掉，再谈怎么办。
+    """
+    FULL = float(meta.get("满分") or 40)
+    last = s.get("_上次分数")
+    d = (last - s["分数"]) if last is not None else 0
+    weak = s.get("薄弱大题") or []
+    names = [w["名称"] for w in weak[:2]]
+
+    # ---- 消息1：报分，直接把落差说出来 ----
+    if last is None:
+        # 第一次考没有上次可比，不能编「比上次掉了」
+        m1 = f"{short}{ptitle}您好！{exam}改完了，{short}这次 {score_txt}。"
+    elif d > 0:
+        m1 = (f"{short}{ptitle}您好！{exam}改完了，{short}这次 {score_txt}，"
+              f"比上次少了 {d:g} 分。这个落差我看到了，先跟您说清楚，别慌。")
+    else:
+        m1 = f"{short}{ptitle}您好！{exam}改完了，{short}这次 {score_txt}，比上次有点回落。"
+
+    # ---- 消息2：找原因，不指责 ----
+    if last is None:
+        m2 = (f"我把卷子看了一遍，分主要丢在{'、'.join(names)}。"
+              f"这几块不属于难题，是这次没发挥出来。"
+              if names else
+              "我把卷子看了一遍，分丢得比较散，没有集中砸在某一处，属于这次没发挥出来。")
+    elif names:
+        m2 = (f"我把两张卷子对着看了一遍，掉的分集中在{'、'.join(names)}。"
+              f"这几块之前是能做对的，说明不是没学会，是这一讲没顾上，或者当时没进入状态。")
+    else:
+        m2 = ("我把两张卷子对着看了一遍，掉的分比较散，没有集中砸在某一处。"
+              "这种情况多半是这次状态没在，不是能力退回去了。")
+
+    # ---- 消息3：给一个具体动作 ----
+    m3 = ("我的建议是这两周别急着往前赶，先把这几处补回来——"
+          "补的方式很简单，就把他上次做对、这次做错的那几道摆在一起重做一遍，"
+          "让他自己说差在哪。我课上会带他过一遍，家里不用额外加量。")
+
+    # ---- 消息4：给孩子留面子 ----
+    m4 = (f"{short}这段时间的状态我是看在眼里的，一次回落不代表什么。"
+          "把这几处接上，下次就回来了。")
+
+    return "\n---SPLIT---\n".join([m1, m2, m3, m4])
+
+
+def make_progress_feedback(s, meta, short, ptitle, exam, score_txt, trend=""):
+    """进步版：这次不报忧，重点说「这段时间哪里做对了、接下来保持什么」。
+
+    用在进步幅度大的孩子身上——他已经尝到甜头了，这时候最该做的是让他知道
+    甜头是怎么来的，而不是继续念他剩下的毛病。
+    """
+    FULL = float(meta.get("满分") or 40)
+    last = s.get("_上次分数")
+    d = (s["分数"] - last) if last is not None else None
+
+    # ---- 消息1：报分 + 进步（开头就把好消息放出来） ----
+    if d is not None and d > 0:
+        m1 = (f"{short}{ptitle}您好！{exam}改完了，{short}这次 {score_txt}，"
+              f"比上次提高了 {d:g} 分，这个幅度是很明显的。")
+    else:
+        m1 = f"{short}{ptitle}您好！{exam}改完了，{short}这次 {score_txt}，状态在往上走。"
+
+    # ---- 消息2：哪儿守住了 / 还差哪儿 ----
+    weak = {w["名称"] for w in (s.get("薄弱大题") or [])}
+    allsec = [x for x in (meta.get("_sec_names") or []) if x]
+    good = [x for x in allsec if x not in weak]
+    bits = []
+    if good:
+        bits.append(f"{'、'.join(good[:3])}这几块这次一道没错")
+    if weak:
+        bits.append(f"要补的就剩{'、'.join(list(weak)[:2])}")
+    if bits:
+        m2 = ("我特意翻了卷子，" + "，".join(bits) +
+              "。进步不是碰运气，是这段时间的路子走对了。")
+    else:
+        m2 = "我特意翻了卷子，整体都稳住了。进步不是碰运气，是这段时间的路子走对了。"
+
+    # ---- 消息3：护住这个势头 ----
+    m3 = ("接下来最要紧的是别松劲——这个节奏保持住，下次还能往上走。"
+          "回家照旧就行，不用额外加量，加多了反而容易反弹。")
+
+    return "\n---SPLIT---\n".join([m1, m2, m3])
+
+
+def make_special_feedback(s, meta, short, ptitle, exam, score_txt, trend=""):
     """特殊学生专属话术。
 
     适用：基础弱、且「课上带着就能写、回家自己背就写不出来」的依赖带读型学生。
@@ -1971,7 +2229,7 @@ def make_special_feedback(s, meta, short, ptitle, exam, score_txt):
     """
     FULL = meta.get("满分", 40)
     homework = meta.get("任务模式") == "个人小任务"
-    task = f"《{short}的小任务》（附件）"
+    task = "练习（附件）"
 
     p1 = (f"{short}{ptitle}您好！{exam}改完啦，我想跟您把{short}的情况说细一点。\n"
           f"{short}这次考了 {score_txt}。分数我先放一边，有个现象我觉得您需要知道——")
@@ -1981,7 +2239,7 @@ def make_special_feedback(s, meta, short, ptitle, exam, score_txt):
           f"这说明一件事：跟着老师读的时候，是能记住的；"
           f"但现在还离不开人带，一个人学不进去。")
 
-    p3 = (f"四年级靠老师课上带还兜得住，再往上走内容一多，课上就带不过来了，"
+    p3 = (f"这个阶段靠老师课上带还兜得住，再往上走内容一多，课上就带不过来了，"
           f"那时候差距会拉得很快。这是我最担心的地方。")
 
     if homework:
@@ -1994,9 +2252,11 @@ def make_special_feedback(s, meta, short, ptitle, exam, score_txt):
 
     p5 = "咱们一起盯一段时间，我课上也会多抽背。"
 
+    if trend:
+        p1 += trend
     return "\n---SPLIT---\n".join([p1, p2 + "\n" + p3, p4 + "\n" + p5])
 
-def make_reassuring_feedback(s, meta, short, ptitle, exam, score_txt):
+def make_reassuring_feedback(s, meta, short, ptitle, exam, score_txt, trend=""):
     """安心版话术（考得不好，但不让家长焦虑）。
 
     和「特殊学生」那版的区别：
@@ -2022,7 +2282,7 @@ def make_reassuring_feedback(s, meta, short, ptitle, exam, score_txt):
     kn = "、".join(x[0] for x in kp[:2]) if kp else "几个要记要背的地方"
     kt = kp[0][1] if kp and kp[0][1] else ""
     personal = meta.get("任务模式") == "个人小任务"
-    task = f"《{short}的小任务》（附件）"
+    task = "练习（附件）"
 
     FULL = float(meta.get("满分") or 40)
     _pct = 100.0 * float(s["分数"] or 0) / FULL
@@ -2064,13 +2324,15 @@ def make_reassuring_feedback(s, meta, short, ptitle, exam, score_txt):
     if _extra:
         p3 = _extra + "\n" + p3
 
-    p4 = (f"四年级这个阶段，比分数更要紧的是习惯。每天跟着过一遍，"
+    p4 = (f"这个阶段，比分数更要紧的是习惯。每天跟着过一遍，"
           f"慢慢就上来了。我课上也会多带着{short}，您不用着急。")
 
+    if trend:
+        p1 += trend
     return "\n---SPLIT---\n".join([p1, p2 + "\n" + p3, p4])
 
 
-def make_firm_feedback(s, meta, short, ptitle, exam, score_txt):
+def make_firm_feedback(s, meta, short, ptitle, exam, score_txt, trend=""):
     """严正版话术：把问题点透，但不攻击人。
 
     适用：上课没听、回家没背，卷面明显「空着」的学生。
@@ -2090,18 +2352,20 @@ def make_firm_feedback(s, meta, short, ptitle, exam, score_txt):
           f"我交代回家要背的，也没有背。\n"
           f"所以这不是能力问题，是这段时间的学习没有真正落地。")
 
-    p3 = (f"说句实话，这个情况我有点着急。四年级的内容是一环扣一环的，"
+    p3 = (f"说句实话，这个情况我有点着急。这个阶段的内容是一环扣一环的，"
           f"这一讲空着，下一讲就得花双倍时间补。现在补还来得及，再拖下去就吃力了。")
 
     p4 = (f"所以这次想请您配合两件事：\n"
           f"一、每天晚上固定十分钟，陪他把当天要背的过一遍，能背出来才算完成；\n"
           f"二、每次练习和背书麻烦您签个字，我这边每节课都会抽他。\n"
-          f"我把这一讲必须记住的东西列成了一份《{short}的小任务》（附件），"
+          f"我把这一讲必须记住的东西列成了一份练习（附件），"
           f"就按这个来，不用另外找材料。")
 
     p5 = (f"我课上会多盯着他，但光靠课堂时间不够。"
           f"孩子的状态，得咱们两边一起使力才行。")
 
+    if trend:
+        p1 += trend
     return "\n---SPLIT---\n".join([p1, p2 + "\n" + p3, p4 + "\n" + p5])
 
 

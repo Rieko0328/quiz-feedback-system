@@ -104,7 +104,7 @@ def best_match(raw: str, names: list[str]) -> str:
     """把 AI 读出来的名字对到名单上。
 
     先精确匹配，再模糊匹配：长度相同 + 至少一个字相同（且不重叠率低）就认。
-    手写体常把一个字认错（李璞心→李昊心），这种要能兜住。
+    手写体常把一个字认错（李小璞→李昊心），这种要能兜住。
     """
     if not raw:
         return ""
@@ -184,7 +184,7 @@ def wrong_ok(txt: str) -> bool:
 
 
 def looks_like_name(stem: str) -> bool:
-    """文件名像不像中文姓名：2-4 个汉字，允许 A 前缀（如 A李怀森）。"""
+    """文件名像不像中文姓名：2-4 个汉字，允许 A 前缀（如 A李小明）。"""
     t = re.sub(r"^[A-Za-z]", "", stem)
     return bool(re.fullmatch(r"[\u4e00-\u9fff]{2,4}", t))
 
@@ -243,18 +243,47 @@ def parse_json(txt: str) -> dict | None:
             return None
 
 
-def call_api(cfg, prompt, b64, timeout=180):
-    body = {"model": cfg["api_model"], "max_tokens": 8000, "stream": False,
-            "messages": [{"role": "user", "content": [
-                {"type": "text", "text": prompt},
-                {"type": "image_url",
-                 "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}]}]}
+# 有些模型（如智谱 GLM-4V-Flash）max_tokens 上限只有 1024，
+# 遇到服务端报"参数非法"就自动降级并记住，不用改配置。
+_MAX_TOKENS = {}
+
+
+def _post(cfg, body, timeout):
     req = urllib.request.Request(
         cfg["api_base"], data=json.dumps(body).encode(),
         headers={"Content-Type": "application/json",
                  "Authorization": f"Bearer {cfg['api_key']}"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        d = json.loads(r.read().decode())
+        return json.loads(r.read().decode())
+
+
+def call_api(cfg, prompt, b64, timeout=180):
+    key = cfg["api_base"]
+    try:
+        mt = int(str(cfg.get("max_tokens") or 8000).strip())
+    except Exception:
+        mt = 8000
+    mt = _MAX_TOKENS.get(key, mt)
+    body = {"model": cfg["api_model"], "max_tokens": mt, "stream": False,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url",
+                 "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}]}]}
+    try:
+        d = _post(cfg, body, timeout)
+    except urllib.error.HTTPError as e:
+        msg = ""
+        try:
+            msg = e.read().decode("utf-8", "replace")
+        except Exception:
+            pass
+        # max_tokens 超限 -> 降到 1000 重试一次，并记住
+        if e.code == 400 and "max_tokens" in msg:
+            body["max_tokens"] = 1000
+            _MAX_TOKENS[key] = 1000
+            d = _post(cfg, body, timeout)
+        else:
+            raise RuntimeError(f"HTTP {e.code}: {msg[:300]}")
     m = d["choices"][0]["message"]
     return m.get("content", ""), (m.get("reasoning_content") or "")
 
@@ -276,9 +305,93 @@ def build_prompt(sec_names, want_name: bool):
     p.append("")
     p.append("只输出一行 JSON，不要任何解释和 markdown 代码块。格式：")
     p.append("{" + ", ".join(keys + [f'"{x}": 扣分数字' for x in sec_names]) + "}")
-    p.append("分数不确定时，估计一个最可能的数字，不要省略。")
+    # 实测最容易错的一种情况：老师只在右栏写了扣分，分数栏空着。
+    # 这时模型会去猜总分（把旁边的红笔痕当数字），错得很离谱 ——
+    # 演示数据 IMG_0001 就因此读成 26，实际是 40-3-1=36。
+    p.append("**重要**：如果「分数」那一栏是空白的，不要猜！"
+             "用「满分 减去 所有大题扣分的总和」算出来。")
+    p.append("例：满分 40，右栏写着 -3 和 -1，那分数就是 40 - 3 - 1 = 36。")
+    p.append("只是分数栏空白不算「读不清」，按上面这个办法算就一定对。")
+    p.append("其它情况分数不确定时，估计一个最可能的数字，不要省略。")
     p.append("请直接给出最终 JSON，不要写长篇分析过程。")
     return "\n".join(p)
+
+
+def read_section_values(cfg, b64, sec_names, timeout=120):
+    """单独问一次：这张卷子每个大题的满分是多少。
+
+    卷面上通常印着「（每题1分，共20分）」，让 AI 读这个，不要它自己算。
+    故意做成独立的一次调用：塞进主提示词会拖垮分数识别的准确率
+    （错题号那次就是这么翻车的）。
+    """
+    meta = read_paper_meta(cfg, b64, sec_names, timeout=timeout)
+    return (meta or {}).get("大题分值")
+
+
+def read_paper_meta(cfg, b64, sec_names, timeout=120):
+    """单独问一次：这张卷子的【满分 / 每个大题的分值 / 每个大题的题数】。
+
+    全部从卷面印刷的信息里读，不让模型自己算：
+      · 满分    —— 标题下「（满分 40 分）」或「（满分 100 分）」
+      · 大题分值 —— 每个大题标题后的「（每题1分，共20分）」→ 20
+                    或「（每题2分，共10分）」→ 10
+      · 大题题数 —— 同上括号里的「共 X 分 / 每题 Y 分」，由 分值÷每题 或直接数题号得出
+
+    返回 {"满分": 40.0, "大题分值": [20,5,10,5], "大题题数": [20,5,5,5]}
+    读不全就返回 None，交给老师填 —— 绝不猜。
+    """
+    sec = "、".join(sec_names)
+    pr = (
+        "这是一张小学英语试卷或答题卡的照片。只做一件事：把卷面上【印的】分值信息读出来。\n"
+        f"卷面上的大题依次是：{sec}。\n\n"
+        "要读三样：\n"
+        "1) 满分：一般在标题下面，写着「（满分 40 分）」或「（满分 100 分）」，读那个数字。\n"
+        "2) 每个大题的分值：看大题标题后面的括号，"
+        "比如「（每题1分，共20分）」这个大题就是 20 分；"
+        "「（每题2分，共10分）」就是 10 分。\n"
+        "3) 每个大题的题数：括号里的「共 X 分」通常就是题数（每题1分时）；"
+        "如果每题不止1分，就用 分值 ÷ 每题分 = 题数。\n\n"
+        "注意：\n"
+        "- 只读卷面上印的字，不要自己算总分、不要推测\n"
+        "- 哪个大题没写分值就填 0，不要填你猜的\n"
+        "- 数组长度必须和大题数量一一对应\n\n"
+        "只输出一行 JSON，不要任何解释：\n"
+        '{"满分": 40, "大题分值": [20, 5, 10, 5], "大题题数": [20, 5, 5, 5]}'
+    )
+    try:
+        txt, reasoning = call_api(cfg, pr, b64, timeout=timeout)
+    except Exception:
+        return None
+    d = parse_json(txt) or parse_json(reasoning) or {}
+
+    def _nums(v):
+        if not isinstance(v, list):
+            return None
+        out = []
+        for x in v:
+            try:
+                out.append(float(x))
+            except (TypeError, ValueError):
+                out.append(0.0)
+        return out
+
+    vals = _nums(d.get("大题分值"))
+    cnts = _nums(d.get("大题题数"))
+    full = d.get("满分")
+    try:
+        full = float(full) if full is not None else None
+    except (TypeError, ValueError):
+        full = None
+
+    if not vals or len(vals) != len(sec_names):
+        return None
+    if sum(vals) <= 0:
+        return None
+    if full is None:
+        full = sum(vals)          # 满分缺失就用分值之和（这是卷面印的，不是猜的）
+    if cnts is not None and len(cnts) != len(sec_names):
+        cnts = None
+    return {"满分": full, "大题分值": vals, "大题题数": cnts}
 
 
 def build_wrong_prompt(sec_names, sec_counts, allow, expect=None):
@@ -600,9 +713,56 @@ def main():
                 errors.append((p.name, err))
                 print(f"  [{idx:2d}/{len(photos)}] {p.name:26s} 读取失败：{err}")
 
+    # ---------- 守卫：课次没填就不许往下跑 ----------
+    # 每个班的课次不一样，默认值一定错。宁可停下来问，也不要把产物写到错的目录里。
+    _bad_lessons = ("", "未填", "0")
+    if str(lesson).strip() in _bad_lessons or "待填" in str(lesson):
+        print("\n[需要你确认] 这个班还没填课次。")
+        print(f"      班级名单/{args.班级}.txt 里的 @课次 是：{lesson!r}")
+        print("      请告诉老师：这次考的是哪一讲？每个班的课次不一样，要单独确认。")
+        print("      确认后把 @课次 改好（或用 --课次 传进来），再跑一次。")
+        return
+
     # ---------- 写核对表 ----------
     outdir = DIR_OUT / f"{args.班级}_{lesson}" if lesson else DIR_OUT / args.班级
     outdir.mkdir(parents=True, exist_ok=True)
+
+    # ---------- 大题分值：单独问第一张照片（只问一次，结果按课次缓存）----------
+    # 校验收到的分值和必须 == 满分。对不上就不落盘，让老师手填 ——
+    # 宁可空着，也不能拿一个「和总分配不上」的分值去算模块得分率。
+    val_json = outdir / "大题分值.json"
+    if not val_json.exists() and photos:
+        try:
+            b64v = encode(photos[0], max_side)
+            pm = read_paper_meta(cfg, b64v, sec_names)
+            if not pm:
+                print("  [需要你确认] 这张卷面没读出分值信息。")
+                print(f"      请在 班级名单/{args.班级}.txt 里手填这三行：")
+                print(f"      @满分: （卷子上印的，比如 40 或 100）")
+                print(f"      @大题题数: {'（按卷面数，如 20,5,5,5）'}")
+                print(f"      @大题分值: {'（按卷面印的填，数量和各大题一一对应）'}")
+            else:
+                vals = pm["大题分值"]
+                paper_full = pm.get("满分")
+                txt = "、".join(f"{n}{v:g}" for n, v in zip(sec_names, vals))
+                print(f"  卷面分值（读图）：{txt}　合计 {sum(vals):g} 分"
+                      f"{'　卷面满分 ' + format(paper_full, 'g') if paper_full else ''}")
+                # 满分优先认卷面印的；卷面和分值之和对不上就停下来问老师
+                if paper_full and abs(sum(vals) - paper_full) > 0.01:
+                    print(f"  [需要你确认] 分值之和 {sum(vals):g} ≠ 卷面满分 {paper_full:g}")
+                    print(f"      可能是某个大题的「共 X 分」没读准。请在名单里手填：")
+                    print(f"      @满分: {paper_full:g}")
+                    print(f"      @大题分值: {','.join(f'{v:g}' for v in vals)}")
+                else:
+                    val_json.write_text(json.dumps({
+                        "满分": paper_full,
+                        "大题分值": vals,
+                        "大题题数": pm.get("大题题数"),
+                        "_来源": photos[0].name,
+                        "_大题名称": sec_names,
+                    }, ensure_ascii=False, indent=1), encoding="utf-8")
+        except Exception as e:
+            print(f"  [注意] 卷面分值没读到：{type(e).__name__}（不影响识别）")
     xlsx = outdir / "识别核对表.xlsx"
     txtf = outdir / "识别核对表.txt"
     try:
@@ -716,7 +876,53 @@ def merge_into_roster(args):
     except Exception as e:
         print(f"[注意] 错题号转换失败：{type(e).__name__}: {e}")
 
-    txt = rp.read_text(encoding="utf-8-sig")
+    # ---- 名单里没有 @满分 / @大题题数 / @大题分值？用读图的结果补上 ----
+    # 满分一律以卷面印的为准，名单里那个只是占位值，会被覆盖。
+    val_json = path.parent / "大题分值.json"
+    paper = {}
+    if val_json.exists():
+        try:
+            import json as _json
+            _d = _json.loads(val_json.read_text(encoding="utf-8-sig"))
+            if isinstance(_d.get("大题分值"), list) and _d["大题分值"]:
+                paper["大题分值"] = ",".join(f"{float(x):g}" for x in _d["大题分值"])
+            if _d.get("满分"):
+                paper["满分"] = f"{float(_d['满分']):g}"
+            if isinstance(_d.get("大题题数"), list) and _d["大题题数"]:
+                paper["大题题数"] = ",".join(f"{float(x):g}" for x in _d["大题题数"])
+        except Exception:
+            paper = {}
+
+    if paper:
+        lines = rp.read_text(encoding="utf-8-sig").splitlines()
+        changed = []
+        for key, val in paper.items():
+            tag = f"@{key}"
+            # 已有这一行 → 覆盖（满分/题数/分值都该以卷面为准）
+            hit = None
+            for i, ln in enumerate(lines):
+                if ln.strip().startswith(tag) and (
+                        len(ln.strip()) == len(tag) or ln.strip()[len(tag)] in " :："):
+                    hit = i
+                    break
+            if hit is not None:
+                old = lines[hit].split(":", 1)[-1].strip()
+                if old != val:
+                    lines[hit] = f"@{key}: {val}"
+                    changed.append(f"{key} {old} → {val}")
+            else:
+                # 没有就插在 @ 段末尾
+                ins_at = None
+                for i, ln in enumerate(lines):
+                    if ln.strip().startswith("@"):
+                        ins_at = i + 1
+                if ins_at is not None:
+                    lines.insert(ins_at, f"@{key}: {val}")
+                    changed.append(f"{key}（新增）{val}")
+        if changed:
+            rp.write_text("\n".join(lines) + "\n", encoding="utf-8-sig")
+            print(f"  [名单] 按卷面更新：{'；'.join(changed)}")
+
     out, n, have = [], 0, set()
     for raw in txt.splitlines():
         s = raw.strip()
